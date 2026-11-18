@@ -155,6 +155,12 @@ def create_app() -> FastAPI:
                       pending=pending[:200], pending_count=len(pending),
                       calc=services.calc_info(db), msg="", ok=1)
 
+    @app.get("/sequence", response_class=HTMLResponse)
+    def sequence_page(request: Request):
+        report = services.sequence_report(db)
+        return render(request, "sequence.html", report=report, msg="", ok=1,
+                      refresh=report["stale"])
+
     # ------------------------------------------------------------ JSON API
 
     @app.get("/api/status")
@@ -214,6 +220,11 @@ def create_app() -> FastAPI:
     def api_pending():
         pend = services.pending_readings(db)
         return {"count": len(pend), "pending": pend}
+
+    @app.get("/api/sequence")
+    def api_sequence():
+        """时序核查：以段号为重启顺序，逐对核对相邻段边界读数。"""
+        return services.sequence_report(db)
 
     return app
 

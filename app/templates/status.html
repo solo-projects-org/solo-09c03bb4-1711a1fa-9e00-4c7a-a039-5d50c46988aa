@@ -25,6 +25,31 @@
   </form>
 </div>
 
+<h3>时序核查（按重启顺序核对相邻段边界）</h3>
+<div class="card">
+  {% set sq = st.sequence %}
+  <p>
+    核查版本：<b>v{{ sq.calc_version }}</b>
+    　通过 <span class="{{ 'warn' if sq.stale else 'ok' }}">{{ sq.pass }}</span>
+    　冲突 <span class="err">{{ sq.conflict }}</span>
+    　待核 <span class="warn">{{ sq.pending }}</span>
+    　<a href="/sequence">查看详情</a>
+  </p>
+  {% if sq.stale %}
+  <p class="warn">
+    {% if sq.calc_version > 0 %}有变更尚未追平（重算中或失败）：以上为上一完整版
+      v{{ sq.calc_version }} 的回看数据，供数资格一律暂不生效。{% else %}
+    尚未生成任何完整核查结论，正在等待首次重算。{% endif %}
+  </p>
+  {% endif %}
+  {% if sq.blocked_segments %}
+  <p class="err">不可交付的段：<b>{{ sq.blocked_segments|join('、') }}</b></p>
+  {% endif %}
+  {% if sq.pending_segments %}
+  <p class="warn">待核的段：<b>{{ sq.pending_segments|join('、') }}</b></p>
+  {% endif %}
+</div>
+
 <h3>校时锚点</h3>
 {% if st.anchors %}
 <table>

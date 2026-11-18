@@ -19,19 +19,41 @@
 {% if result %}
 <h3>{{ result.date }}（UTC）已校时读数：{{ result.count }} 条
     <span class="hint">（校时版本 v{{ result.calc_version }}）</span></h3>
+{% if result.sequence.stale %}
+<p class="warn">
+  {% if result.calc_version > 0 %}
+  当前有未追平的变更，本页读数与供数资格均来自上一完整版
+  v{{ result.calc_version }}，全部标为「仅可回看」；追平后自动更新，追平前不得据此交付。
+  {% else %}
+  首次重算尚未完成，暂无已发布结果。
+  {% endif %}
+</p>
+{% endif %}
+{% if result.blocked_count %}
+<p class="err">其中 {{ result.blocked_count }} 条所属段存在时序冲突或待核，已标为
+  <b>不可交付 / 待核</b>：可查看读数，但不得用于按日供数。</p>
+{% endif %}
 {% if result.readings %}
 <table>
   <tr><th>批次号</th><th>原行号</th><th>段号</th><th>本地秒数</th><th>温度</th>
-      <th>校时后 UTC</th><th>锚点版本</th><th>校时版本</th></tr>
+      <th>校时后 UTC</th><th>锚点版本</th><th>校时版本</th><th>供数资格</th></tr>
   {% for r in result.readings %}
-  <tr>
+  <tr{% if not r.deliverable %} style="background:#fff6f6"{% endif %}>
     <td>{{ r.batch_id }}</td><td>{{ r.row_no }}</td><td>{{ r.segment }}</td>
     <td class="mono">{{ r.local_seconds }}</td><td>{{ r.temperature }}</td>
     <td class="mono">{{ r.utc_time }}</td>
     <td>v{{ r.anchor_version }}</td><td>v{{ r.calc_version }}</td>
+    <td>
+      {% if r.delivery_status == 'deliverable' %}<span class="ok">可交付</span>
+      {% elif r.delivery_status == 'blocked' %}<span class="err"><b>不可交付</b></span>
+      {% elif r.delivery_status == 'stale' %}<span class="warn"><b>仅可回看</b></span>
+      {% else %}<span class="warn"><b>待核</b></span>{% endif %}
+    </td>
   </tr>
   {% endfor %}
 </table>
+<p class="hint">供数资格来自通过 / 冲突 / 待核三态时序核查，详见
+  <a href="/sequence">时序核查</a>。</p>
 {% else %}
 <p class="hint">该日无已校时读数。</p>
 {% endif %}

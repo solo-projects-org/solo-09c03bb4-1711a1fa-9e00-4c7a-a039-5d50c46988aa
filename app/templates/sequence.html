@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}时序核查 - 冷链记录仪校时平台{% endblock %}
+{% block content %}
+<h2>相邻开机段时序核查</h2>
+
+{% if report.stale %}
+<div class="msg err">
+  {% if report.calc_version > 0 %}
+  当前有未追平的变更（重算中或重算失败）：以下仅为<b>上一完整校时版 v{{ report.calc_version }}</b>
+  的核查结论，只能回看，不代表最新数据；追平前按日供数资格一律不生效。重启或重算恢复后自动补算。
+  {% else %}
+  尚未生成任何完整核查结论（首次重算尚未完成）：暂无可供回看的结论，追平后自动出现。
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <p>
+    重启顺序即<b>开机段号升序</b>。逐对核对相邻段的<b>前段末点</b>（段内本地秒数最大的原始读数）
+    与<b>后段首点</b>（段内本地秒数最小的原始读数）在已发布校时版中的时刻。
+  </p>
+  <p>
+    核查版本：<b>v{{ report.calc_version }}</b>
+    　通过 <span class="ok">{{ report.summary.pass }}</span>
+    　冲突 <span class="err">{{ report.summary.conflict }}</span>
+    　待核 <span class="warn">{{ report.summary.pending }}</span>
+  </p>
+  <p class="hint">
+    前段末点 UTC 严格早于后段首点 UTC → 通过；不早于 → 冲突；
+    任一边界读数未校时（无锚点/超出范围）→ 待核。待核绝不显示为通过。
+  </p>
+  {% if report.summary.blocked_segments %}
+  <p class="err">存在时序冲突，按日供数标记为不可交付的段：
+    <b>{{ report.summary.blocked_segments|join('、') }}</b></p>
+  {% endif %}
+  {% if report.summary.pending_segments %}
+  <p class="warn">边界未校时、按日供数待核的段：
+    <b>{{ report.summary.pending_segments|join('、') }}</b></p>
+  {% endif %}
+  {% if report.summary.stale_segments %}
+  <p class="warn">未追平：以下段的旧版结论仅可回看，不参与供数资格判定：
+    <b>{{ report.summary.stale_segments|join('、') }}</b></p>
+  {% endif %}
+</div>
+
+<h3>相邻段核查（{{ report.checks|length }} 对）</h3>
+{% if report.checks %}
+<table>
+  <tr>
+    <th>前段 → 后段</th><th>结论</th>
+    <th>前段末点：批次号 / 原行号</th><th>前段末点本地秒数</th><th>前段末点 UTC</th>
+    <th>后段首点：批次号 / 原行号</th><th>后段首点本地秒数</th><th>后段首点 UTC</th>
+    <th>说明</th>
+  </tr>
+  {% for c in report.checks %}
+  <tr>
+    <td>{{ c.prev_segment }} → {{ c.next_segment }}</td>
+    <td>
+      {% set old = '（旧版，仅回看）' if report.stale else '' %}
+      {% if c.status == 'pass' %}<span class="{{ 'warn' if report.stale else 'ok' }}">通过{{ old }}</span>
+      {% elif c.status == 'conflict' %}<span class="err"><b>冲突{{ old }}</b></span>
+      {% else %}<span class="warn"><b>待核{{ old }}</b></span>{% endif %}
+    </td>
+    <td>{{ c.prev.batch_id }} / {{ c.prev.row_no }}</td>
+    <td class="mono">{{ c.prev.local_seconds }}</td>
+    <td class="mono">{{ c.prev.utc_time or '未校时' }}</td>
+    <td>{{ c.next.batch_id }} / {{ c.next.row_no }}</td>
+    <td class="mono">{{ c.next.local_seconds }}</td>
+    <td class="mono">{{ c.next.utc_time or '未校时' }}</td>
+    <td>{{ c.reason or '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">不足两个开机段，暂无可核查的相邻段。</p>
+{% endif %}
+
+<h3>各段边界与按日供数资格</h3>
+{% if report.segments %}
+<table>
+  <tr><th>段号</th><th>点数</th><th>已校时点数</th>
+      <th>首点 批次/行号</th><th>首点本地秒</th><th>首点 UTC</th>
+      <th>末点 批次/行号</th><th>末点本地秒</th><th>末点 UTC</th>
+      <th>供数资格</th><th>说明</th></tr>
+  {% for s in report.segments %}
+  <tr>
+    <td>{{ s.segment }}</td><td>{{ s.point_count }}</td><td>{{ s.calibrated_count }}</td>
+    <td>{{ s.first.batch_id }} / {{ s.first.row_no }}</td>
+    <td class="mono">{{ s.first.local_seconds }}</td>
+    <td class="mono">{{ s.first.utc_time or '未校时' }}</td>
+    <td>{{ s.last.batch_id }} / {{ s.last.row_no }}</td>
+    <td class="mono">{{ s.last.local_seconds }}</td>
+    <td class="mono">{{ s.last.utc_time or '未校时' }}</td>
+    <td>
+      {% if s.delivery.status == 'deliverable' %}<span class="ok">可交付</span>
+      {% elif s.delivery.status == 'blocked' %}<span class="err"><b>不可交付</b></span>
+      {% elif s.delivery.status == 'stale' %}<span class="warn"><b>仅可回看</b></span>
+      {% else %}<span class="warn"><b>待核</b></span>{% endif %}
+    </td>
+    <td>{{ s.delivery.reason or '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">尚无读数。请先上传数据并录入锚点。</p>
+{% endif %}
+{% endblock %}

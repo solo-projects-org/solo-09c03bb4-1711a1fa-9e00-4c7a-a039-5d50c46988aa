@@ -8,6 +8,7 @@ from datetime import datetime
 
 from .config import Settings
 from .db import Database
+from .sequence import segment_delivery
 from .timeutil import fmt_utc, utcnow_iso
 
 
@@ -154,9 +155,9 @@ def list_anchors(db: Database) -> list[dict]:
 
 # ---------------------------------------------------------------- 查询
 
-def calc_info(db: Database) -> dict:
-    row = db.query_one("SELECT * FROM calc_state WHERE id = 1")
-    meta = {r["key"]: r["value"] for r in db.query("SELECT key, value FROM meta")}
+def _calc_info(conn) -> dict:
+    row = conn.execute("SELECT * FROM calc_state WHERE id = 1").fetchone()
+    meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
     state_gen = int(meta.get("state_generation", "0"))
     calibrated_gen = int(meta.get("calibrated_generation", "-1"))
     return {
@@ -170,28 +171,52 @@ def calc_info(db: Database) -> dict:
     }
 
 
+def calc_info(db: Database) -> dict:
+    return db.snapshot(_calc_info)
+
+
 def query_by_date(db: Database, date_str: str) -> dict:
     try:
         day = datetime.strptime((date_str or "").strip(), "%Y-%m-%d").date()
     except ValueError:
         raise ServiceError("日期格式须为 YYYY-MM-DD", code="BAD_DATE")
-    info = calc_info(db)
-    rows = db.query(
-        """
-        SELECT c.reading_id, c.utc_time, c.anchor_version, c.calc_version,
-               r.batch_id, r.row_no, r.segment, r.local_seconds, r.temperature
-        FROM calibrated c JOIN readings r ON r.id = c.reading_id
-        WHERE c.utc_date = ?
-        ORDER BY c.utc_time, c.reading_id
-        """,
-        (day.isoformat(),),
-    )
+
+    def fn(conn):
+        info = _calc_info(conn)
+        rows = conn.execute(
+            """
+            SELECT c.reading_id, c.utc_time, c.anchor_version, c.calc_version,
+                   r.batch_id, r.row_no, r.segment, r.local_seconds, r.temperature
+            FROM calibrated c JOIN readings r ON r.id = c.reading_id
+            WHERE c.utc_date = ?
+            ORDER BY c.utc_time, c.reading_id
+            """,
+            (day.isoformat(),),
+        ).fetchall()
+        report = _sequence_report(conn, info)
+        return info, rows, report
+
+    info, rows, report = db.snapshot(fn)
+    report = _finalize_report(report)
+    delivery = {s["segment"]: s["delivery"] for s in report["segments"]}
+    readings = []
+    for r in rows:
+        item = dict(r)
+        d = delivery.get(item["segment"])
+        # 核查结论缺失时不得声称可交付，一律按待核展示。
+        item["delivery_status"] = d["status"] if d else "pending"
+        item["delivery_reason"] = d["reason"] if d else "时序核查结果缺失，待核"
+        item["deliverable"] = item["delivery_status"] == "deliverable"
+        readings.append(item)
     return {
         "date": day.isoformat(),
         "calc_version": info["version"],
         "dirty": info["dirty"],
+        "stale": report["stale"],
         "count": len(rows),
-        "readings": [dict(r) for r in rows],
+        "blocked_count": sum(1 for r in readings if not r["deliverable"]),
+        "readings": readings,
+        "sequence": report,
     }
 
 
@@ -214,6 +239,141 @@ def pending_readings(db: Database) -> list[dict]:
     return out
 
 
+def _sequence_rows(conn, table: str, version: int):
+    return [dict(r) for r in conn.execute(
+        f"SELECT * FROM {table} WHERE calc_version = ? ORDER BY "
+        + ("segment" if table == "sequence_segments" else "prev_segment, next_segment"),
+        (version,),
+    )]
+
+
+def _normalize_segment_row(s: dict) -> dict:
+    s["boundary_status"] = s.pop("status")
+    s["boundary_reason"] = s.pop("reason")
+    s["first"] = {
+        "reading_id": s.pop("first_reading_id"),
+        "batch_id": s.pop("first_batch_id"),
+        "row_no": s.pop("first_row_no"),
+        "local_seconds": s.pop("first_local_seconds"),
+        "utc_time": s.pop("first_utc"),
+        "anchor_version": s.pop("first_anchor_version"),
+        "segment": s["segment"],
+    }
+    s["last"] = {
+        "reading_id": s.pop("last_reading_id"),
+        "batch_id": s.pop("last_batch_id"),
+        "row_no": s.pop("last_row_no"),
+        "local_seconds": s.pop("last_local_seconds"),
+        "utc_time": s.pop("last_utc"),
+        "anchor_version": s.pop("last_anchor_version"),
+        "segment": s["segment"],
+    }
+    s.pop("calc_version", None)
+    return s
+
+
+def _normalize_check_row(c: dict) -> dict:
+    c.pop("calc_version", None)
+    c["prev"] = {
+        "reading_id": c.pop("prev_reading_id"),
+        "batch_id": c.pop("prev_batch_id"),
+        "row_no": c.pop("prev_row_no"),
+        "local_seconds": c.pop("prev_local_seconds"),
+        "utc_time": c.pop("prev_utc"),
+        "anchor_version": c.pop("prev_anchor_version"),
+        "segment": c["prev_segment"],
+    }
+    c["next"] = {
+        "reading_id": c.pop("next_reading_id"),
+        "batch_id": c.pop("next_batch_id"),
+        "row_no": c.pop("next_row_no"),
+        "local_seconds": c.pop("next_local_seconds"),
+        "utc_time": c.pop("next_utc"),
+        "anchor_version": c.pop("next_anchor_version"),
+        "segment": c["next_segment"],
+    }
+    return c
+
+
+def _sequence_report(conn, info: dict) -> dict:
+    """当前已发布校时版的时序核查报告（含每段供数资格）。
+
+    直接读已提交的核查行，不重新计算：页面/接口展示的永远是那一版完整结论。
+    """
+    version = info["version"]
+    segments = [_normalize_segment_row(r)
+                for r in _sequence_rows(conn, "sequence_segments", version)]
+    checks = [_normalize_check_row(r)
+              for r in _sequence_rows(conn, "sequence_checks", version)]
+    delivery = segment_delivery(segments, checks)
+    for s in segments:
+        s["delivery"] = delivery.get(s["segment"], {"status": "pending", "reason": "待核"})
+    return {
+        "calc_version": version,
+        "published": version > 0,
+        "stale": info["dirty"] or info["status"] != "idle",
+        "segments": segments,
+        "checks": checks,
+        "summary": {
+            "segments": len(segments),
+            "pass": sum(1 for c in checks if c["status"] == "pass"),
+            "conflict": sum(1 for c in checks if c["status"] == "conflict"),
+            "pending": sum(1 for c in checks if c["status"] == "pending"),
+            "blocked_segments": [s["segment"] for s in segments
+                                 if s["delivery"]["status"] == "blocked"],
+            "pending_segments": [s["segment"] for s in segments
+                                 if s["delivery"]["status"] == "pending"],
+            "deliverable_segments": [s["segment"] for s in segments
+                                     if s["delivery"]["status"] == "deliverable"],
+        },
+    }
+
+
+def _finalize_report(report: dict) -> dict:
+    """未追平时把上一完整版的供数资格降级为「仅可回看」。
+
+    旧版结论可以展示（不得凭空删除），但绝不能标成可交付/通过；
+    追溯平后由新版本整体替换。
+    """
+    if report["stale"]:
+        for s in report["segments"]:
+            old = s["delivery"]
+            s["published_delivery"] = old
+            s["delivery"] = {
+                "status": "stale",
+                "reason": "有变更未追平，旧版结论仅可回看，追平前不得据此交付",
+            }
+        report["summary"]["deliverable_segments"] = []
+        report["summary"]["stale_segments"] = [s["segment"] for s in report["segments"]]
+    else:
+        report["summary"]["stale_segments"] = []
+    return report
+
+
+def sequence_report(db: Database) -> dict:
+    def fn(conn):
+        return _sequence_report(conn, _calc_info(conn))
+    return _finalize_report(db.snapshot(fn))
+
+
+def sequence_summary(db: Database) -> dict:
+    """状态页用的精简摘要。"""
+    report = sequence_report(db)
+    segments, checks = report["segments"], report["checks"]
+    return {
+        "calc_version": report["calc_version"],
+        "stale": report["stale"],
+        "pass": report["summary"]["pass"],
+        "conflict": report["summary"]["conflict"],
+        "pending": report["summary"]["pending"],
+        "blocked_segments": report["summary"]["blocked_segments"],
+        "pending_segments": report["summary"]["pending_segments"],
+        "conflicts": [c for c in checks if c["status"] == "conflict"],
+        "pending_checks": [c for c in checks if c["status"] == "pending"],
+        "segment_count": len(segments),
+    }
+
+
 def get_status(db: Database, cfg: Settings) -> dict:
     accepted = db.query_one("SELECT COUNT(*) AS c FROM readings")["c"]
     batches = [
@@ -225,4 +385,5 @@ def get_status(db: Database, cfg: Settings) -> dict:
         "anchors": list_anchors(db),
         "batches": batches,
         "pending_count": len(pending_readings(db)),
+        "sequence": sequence_summary(db),
     }

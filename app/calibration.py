@@ -9,6 +9,10 @@
   新日加入”同时生效；计算或提交失败时旧版本原样保留，绝不提供半版。
 - state_generation 持久化，服务重启后启动线程会比对代次并补算，
   所有已接纳且处于锚点范围的点最终都会进入当前版。
+
+时序核查同样纳入这一套一致性规则：相邻开机段的「前段末点 vs 后段首点」
+结论与 calibrated / calc_state 在同一个事务内整体换版。未追平（重算中/失败）
+时只留下上一完整版的核查结论供回看，绝不出现半版结论。
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import time
 from datetime import datetime, timezone
 
 from .db import Database
+from .sequence import build_sequence
 from .timeutil import fmt_utc, parse_utc, utcnow_iso
 
 log = logging.getLogger("recalc")
@@ -60,7 +65,7 @@ def load_snapshot(db: Database):
         state_gen = int(meta.get("state_generation", "0"))
         calibrated_gen = int(meta.get("calibrated_generation", "-1"))
         readings = conn.execute(
-            "SELECT id, segment, local_seconds FROM readings ORDER BY id"
+            "SELECT id, segment, local_seconds, batch_id, row_no FROM readings ORDER BY id"
         ).fetchall()
         anchors = {}
         for a in conn.execute("SELECT * FROM anchors").fetchall():
@@ -73,8 +78,14 @@ def load_snapshot(db: Database):
     return db.snapshot(fn)
 
 
-def commit_calc(db: Database, generation: int, rows: list[dict]) -> int:
-    """单事务整体换版。代次不符则抛 StaleState（不提交）。"""
+def commit_calc(db: Database, generation: int, rows: list[dict],
+                sequence: tuple[list[dict], list[dict]]) -> int:
+    """单事务整体换版：校时结果 + 时序核查结论一起替换。代次不符则抛 StaleState。
+
+    calibrated、sequence_segments、sequence_checks 与 calc_state.version 在同一
+    事务内更新：要么全部换成新版本，要么旧版本原样保留，不存在半版结论。
+    """
+    segments, checks = sequence
     with db.tx() as cur:
         cur_gen = int(
             cur.execute("SELECT value FROM meta WHERE key = 'state_generation'")
@@ -92,6 +103,51 @@ def commit_calc(db: Database, generation: int, rows: list[dict]) -> int:
             [
                 (r["reading_id"], r["utc_time"], r["utc_date"], r["anchor_version"], new_version)
                 for r in rows
+            ],
+        )
+        cur.execute("DELETE FROM sequence_segments")
+        cur.executemany(
+            "INSERT INTO sequence_segments("
+            " calc_version, segment, status, reason, point_count, calibrated_count,"
+            " first_reading_id, first_batch_id, first_row_no, first_local_seconds,"
+            " first_utc, first_anchor_version,"
+            " last_reading_id, last_batch_id, last_row_no, last_local_seconds,"
+            " last_utc, last_anchor_version)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    new_version, s["segment"], s["boundary_status"], s["boundary_reason"],
+                    s["point_count"], s["calibrated_count"],
+                    s["first"]["reading_id"], s["first"]["batch_id"],
+                    s["first"]["row_no"], s["first"]["local_seconds"],
+                    s["first"]["utc_time"], s["first"]["anchor_version"],
+                    s["last"]["reading_id"], s["last"]["batch_id"],
+                    s["last"]["row_no"], s["last"]["local_seconds"],
+                    s["last"]["utc_time"], s["last"]["anchor_version"],
+                )
+                for s in segments
+            ],
+        )
+        cur.execute("DELETE FROM sequence_checks")
+        cur.executemany(
+            "INSERT INTO sequence_checks("
+            " calc_version, prev_segment, next_segment, status, reason,"
+            " prev_reading_id, prev_batch_id, prev_row_no, prev_local_seconds,"
+            " prev_utc, prev_anchor_version,"
+            " next_reading_id, next_batch_id, next_row_no, next_local_seconds,"
+            " next_utc, next_anchor_version)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    new_version, c["prev_segment"], c["next_segment"], c["status"], c["reason"],
+                    c["prev"]["reading_id"], c["prev"]["batch_id"],
+                    c["prev"]["row_no"], c["prev"]["local_seconds"],
+                    c["prev"]["utc_time"], c["prev"]["anchor_version"],
+                    c["next"]["reading_id"], c["next"]["batch_id"],
+                    c["next"]["row_no"], c["next"]["local_seconds"],
+                    c["next"]["utc_time"], c["next"]["anchor_version"],
+                )
+                for c in checks
             ],
         )
         cur.execute(
@@ -161,9 +217,10 @@ class RecalcWorker:
             set_status(self.db, "running")
             try:
                 rows = compute_calibration(readings, anchors)
+                sequence = build_sequence(readings, rows)
                 if self.delay > 0:
                     time.sleep(self.delay)  # 放大并发窗口（演示/测试）
-                commit_calc(self.db, state_gen, rows)
+                commit_calc(self.db, state_gen, rows, sequence)
                 self._failures = 0
             except StaleState:
                 log.info("状态已变化，丢弃过期计算并重算")

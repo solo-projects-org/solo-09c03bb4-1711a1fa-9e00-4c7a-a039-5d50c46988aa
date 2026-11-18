@@ -63,6 +63,51 @@ CREATE TABLE IF NOT EXISTS calc_state (
     last_error TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+-- 相邻开机段时序核查：与 calibrated / calc_state 在同一事务内整体换版。
+-- 段号即重启顺序；只保存当前已发布校时版的结论，旧版不保留。
+CREATE TABLE IF NOT EXISTS sequence_segments (
+    calc_version        INTEGER NOT NULL,
+    segment             INTEGER NOT NULL,
+    status              TEXT NOT NULL,       -- ok / conflict / pending
+    reason              TEXT NOT NULL DEFAULT '',
+    point_count         INTEGER NOT NULL,
+    calibrated_count    INTEGER NOT NULL,
+    first_reading_id    INTEGER NOT NULL,
+    first_batch_id      INTEGER NOT NULL,
+    first_row_no        INTEGER NOT NULL,
+    first_local_seconds INTEGER NOT NULL,
+    first_utc           TEXT,                -- NULL 表示该边界读数未校时
+    first_anchor_version INTEGER,
+    last_reading_id     INTEGER NOT NULL,
+    last_batch_id       INTEGER NOT NULL,
+    last_row_no         INTEGER NOT NULL,
+    last_local_seconds  INTEGER NOT NULL,
+    last_utc            TEXT,                -- NULL 表示该边界读数未校时
+    last_anchor_version INTEGER,
+    PRIMARY KEY (calc_version, segment)
+);
+
+CREATE TABLE IF NOT EXISTS sequence_checks (
+    calc_version        INTEGER NOT NULL,
+    prev_segment        INTEGER NOT NULL,
+    next_segment        INTEGER NOT NULL,
+    status              TEXT NOT NULL,       -- pass / conflict / pending
+    reason              TEXT NOT NULL DEFAULT '',
+    prev_reading_id     INTEGER NOT NULL,
+    prev_batch_id       INTEGER NOT NULL,
+    prev_row_no         INTEGER NOT NULL,
+    prev_local_seconds  INTEGER NOT NULL,
+    prev_utc            TEXT,
+    prev_anchor_version INTEGER,
+    next_reading_id     INTEGER NOT NULL,
+    next_batch_id       INTEGER NOT NULL,
+    next_row_no         INTEGER NOT NULL,
+    next_local_seconds  INTEGER NOT NULL,
+    next_utc            TEXT,
+    next_anchor_version INTEGER,
+    PRIMARY KEY (calc_version, prev_segment, next_segment)
+);
 """
 
 
@@ -91,6 +136,34 @@ class Database:
             self._conn.execute(
                 "INSERT OR IGNORE INTO calc_state(id, version, status, updated_at)"
                 " VALUES (1, 0, 'idle', ?)",
+                (utcnow_iso(),),
+            )
+            # 时序核查表随本次升级引入：已有历史结论的旧库必须强制补算一次，
+            # 避免把「没有核查结果」误当成「通过」。全新库无需额外触发。
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('sequence_schema', '0')"
+            )
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'sequence_schema'"
+            ).fetchone()
+            if row["value"] != "1":
+                published = self._conn.execute(
+                    "SELECT version FROM calc_state WHERE id = 1"
+                ).fetchone()["version"]
+                if published > 0:
+                    self._conn.execute(
+                        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                        " WHERE key = 'state_generation'"
+                    )
+                self._conn.execute(
+                    "UPDATE meta SET value = '1' WHERE key = 'sequence_schema'"
+                )
+            # 上次进程在重算中途退出：状态不能继续谎称“重算中”，
+            # 记为上轮未完成，旧版本仍完整，等待本次启动补算。
+            self._conn.execute(
+                "UPDATE calc_state SET status = 'failed',"
+                " last_error = '上次重算未完成（服务中断），旧版结果仅可回看，等待补算',"
+                " updated_at = ? WHERE id = 1 AND status = 'running'",
                 (utcnow_iso(),),
             )
 
